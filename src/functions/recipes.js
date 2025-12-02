@@ -2,119 +2,110 @@ const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
 const jwt = require('jsonwebtoken');
 
-// Same connection + secret style as login/register
 const client = new CosmosClient(process.env.COSMOS_CONNECTION_STRING);
 const SECRET_KEY = process.env.JWT_SECRET || "fallback_secret_key_123";
 
-// HTTP trigger: GET /api/recipes
 app.http('recipes', {
     methods: ['GET'],
     authLevel: 'anonymous',
+    route: 'recipes',
     handler: async (request, context) => {
+        // --------------------------------------------------
+        // 1. SECURITY: Check JWT
+        // --------------------------------------------------
+        const authHeader = request.headers.get('authorization') || request.headers.get('Authorization');
+
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return { status: 401, jsonBody: { error: 'Missing Authorization header' } };
+        }
+
+        const token = authHeader.substring('Bearer '.length);
+
         try {
-            // --------------------------------------------------
-            // 1. Check JWT token in Authorization header
-            // --------------------------------------------------
-            const authHeader =
-                request.headers.get('authorization') ||
-                request.headers.get('Authorization');
+            jwt.verify(token, SECRET_KEY);
+        } catch (err) {
+            return { status: 401, jsonBody: { error: 'Invalid or expired token' } };
+        }
 
-            if (!authHeader || !authHeader.startsWith('Bearer ')) {
-                return {
-                    status: 401,
-                    jsonBody: { error: 'Missing or invalid Authorization header' }
-                };
-            }
+        // --------------------------------------------------
+        // 2. PREPARE PARAMETERS
+        // --------------------------------------------------
+        const dietRaw = (request.query.get('diet') || '').trim();
+        const dietLower = dietRaw.toLowerCase();
+        const keyword = (request.query.get('keyword') || '').trim().toLowerCase();
 
-            const token = authHeader.substring('Bearer '.length);
+        const page = parseInt(request.query.get('page') || '1');
+        const pageSize = parseInt(request.query.get('pageSize') || '10');
+        const offset = (page - 1) * pageSize;
 
-            try {
-                // Will throw if token is invalid/expired
-                jwt.verify(token, SECRET_KEY);
-            } catch (err) {
-                return {
-                    status: 401,
-                    jsonBody: { error: 'Invalid or expired token' }
-                };
-            }
+        // --------------------------------------------------
+        // 3. BUILD QUERY (Mapping DB names to Frontend names)
+        //    DB uses: Title, Diet, Cuisine
+        //    Frontend wants: Recipe_name, Diet_type, Cuisine_type
+        // --------------------------------------------------
 
-            // --------------------------------------------------
-            // 2. Read query params: diet, keyword, page, pageSize
-            // --------------------------------------------------
-            const dietRaw = (request.query.get('diet') || '').trim();
-            const dietLower = dietRaw.toLowerCase();
-            const keyword = (request.query.get('keyword') || '').trim().toLowerCase();
+        // We select specific fields and rename them for the frontend
+        let queryText = `
+            SELECT 
+                c.id, 
+                c.Title as Recipe_name, 
+                c.Diet as Diet_type, 
+                c.Cuisine as Cuisine_type, 
+                c.Protein, 
+                c.Carbs, 
+                c.Fat 
+            FROM c 
+            WHERE 1=1`;
 
-            const page = parseInt(request.query.get('page') || '1', 10);
-            const pageSize = parseInt(request.query.get('pageSize') || '10', 10);
+        const parameters = [];
 
-            const safePage = page > 0 ? page : 1;
-            const safePageSize = pageSize > 0 ? pageSize : 10;
+        // Correct DB Field: "Diet"
+        if (dietRaw && dietLower !== 'all') {
+            queryText += ' AND c.Diet = @diet';
+            parameters.push({ name: '@diet', value: dietLower });
+        }
 
-            // --------------------------------------------------
-            // 3. Build Cosmos DB query
-            //    Recipes look like:
-            //    { id, Title, Diet, Cuisine, Protein, Carbs, Fat }
-            // --------------------------------------------------
-            let queryText = 'SELECT * FROM c WHERE 1=1';
-            const parameters = [];
+        // Correct DB Field: "Title"
+        if (keyword) {
+            queryText += ' AND CONTAINS(LOWER(c.Title), @keyword)';
+            parameters.push({ name: '@keyword', value: keyword });
+        }
 
-            // Filter by diet (if provided and not "all")
-            if (dietRaw && dietLower !== 'all') {
-                // Diet is stored in lower-case in Cosmos
-                queryText += ' AND c.Diet = @diet';
-                parameters.push({ name: '@diet', value: dietLower });
-            }
+        // --------------------------------------------------
+        // 4. EXECUTE QUERY
+        // --------------------------------------------------
+        try {
+            const container = client.database('RecipeDB').container('Recipes');
 
-            // Keyword search in Title
-            if (keyword) {
-                queryText += ' AND CONTAINS(LOWER(c.Title), @keyword)';
-                parameters.push({ name: '@keyword', value: keyword });
-            }
-
-            const querySpec = { query: queryText, parameters };
-
-            // --------------------------------------------------
-            // 4. Query Cosmos DB (RecipeDB / Recipes)
-            // --------------------------------------------------
-            const container = client
-                .database('RecipeDB')
-                .container('Recipes');
-
+            // Fetch all matching items
             const { resources: allItems } = await container.items
-                .query(querySpec)
+                .query({ query: queryText, parameters: parameters })
                 .fetchAll();
 
             const total = allItems.length;
 
             // --------------------------------------------------
-            // 5. Apply pagination in code
+            // 5. PAGINATION (Slice the array)
             // --------------------------------------------------
-            const startIndex = (safePage - 1) * safePageSize;
-            const pagedItems = allItems.slice(
-                startIndex,
-                startIndex + safePageSize
-            );
+            const pagedItems = allItems.slice(offset, offset + pageSize);
 
             // --------------------------------------------------
-            // 6. Return JSON response for frontend
+            // 6. RETURN RESPONSE
             // --------------------------------------------------
             return {
                 status: 200,
                 jsonBody: {
-                    page: safePage,
-                    pageSize: safePageSize,
-                    total,
-                    totalPages: Math.ceil(total / safePageSize),
-                    data: pagedItems
+                    page: page,
+                    pageSize: pageSize,
+                    total: total,
+                    totalPages: Math.ceil(total / pageSize),
+                    data: pagedItems // Now contains Recipe_name, Diet_type, etc.
                 }
             };
+
         } catch (error) {
             context.log('Error in /api/recipes:', error);
-            return {
-                status: 500,
-                jsonBody: { error: 'Server error while fetching recipes' }
-            };
+            return { status: 500, jsonBody: { error: 'Database error' } };
         }
     }
 });
